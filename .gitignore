@@ -1,3 +1,9 @@
+davidson/
+goEmotions/
+SOLID/
+semEval_task7/
+jigsaw/
+.DS_Store
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
