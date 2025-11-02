@@ -4,6 +4,7 @@ SOLID/
 semEval_task7/
 jigsaw/
 .DS_Store
+checkpoints/
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
