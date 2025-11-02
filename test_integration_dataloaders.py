@@ -219,29 +219,36 @@ class TestDataLoaderWithRealData(unittest.TestCase):
         )
         self.assertIn("[SEP]", decoded)
 
+    # --- MODIFIED TEST ---
     def test_07_task_sampler_epoch_length(self):
-        """Tests the TaskSampler calculates correct epoch length."""
-        sampler = data_loading.TaskSampler(self.dataset)
+        """Tests the TaskSampler (default 'min' mode) calculates correct epoch length."""
+        # Initialize sampler with default config (epoch_sampling_size=None)
+        sampler = data_loading.TaskSampler(self.dataset) 
         
-        # Find max task size
-        max_size = max(
+        # Find min task size manually
+        min_size = min(
             len(self.dataset.task_data[task]['texts'])
             for task in sampler.task_names
+            if len(self.dataset.task_data[task]['texts']) > 0 # Ensure task is not empty
         )
         
         num_tasks = len(sampler.task_names)
-        expected_epoch_size = max_size * num_tasks
+        expected_epoch_size = min_size * num_tasks
         
-        self.assertEqual(sampler.max_task_size, max_size)
+        # Check that the sampler's internal size matches the min_size
+        self.assertEqual(sampler.task_epoch_size, min_size)
+        
+        # Check that the total sampler length is correct
         self.assertEqual(len(sampler), expected_epoch_size)
         
-        print(f"\n--- TaskSampler Info ---")
+        print(f"\n--- TaskSampler Info (Default 'min' Mode) ---")
         print(f"Tasks: {sampler.task_names}")
-        print(f"Max task size: {max_size:,}")
-        print(f"Epoch size: {expected_epoch_size:,}\n")
+        print(f"Min task size: {min_size:,}")
+        print(f"Epoch size (min_size * num_tasks): {expected_epoch_size:,}\n")
 
     def test_08_dataloader_batch_shapes(self):
         """Tests the DataLoader produces correct batch shapes."""
+        # Use default 'min' sampler
         sampler = data_loading.TaskSampler(self.dataset)
         batch_size = 16
         
@@ -290,15 +297,17 @@ class TestDataLoaderWithRealData(unittest.TestCase):
         self.assertEqual(batch['labels_olid'].dtype, torch.long)
         self.assertEqual(batch['labels_rumour'].dtype, torch.long)
 
+    # --- MODIFIED TEST ---
     def test_09_task_sampler_distribution(self):
         """
-        Tests that TaskSampler balances tasks by sampling each
-        task max_task_size times per epoch.
+        Tests that TaskSampler (default 'min' mode) balances tasks by sampling each
+        task task_epoch_size (min_size) times per epoch.
         """
+        # Use default 'min' sampler
         sampler = data_loading.TaskSampler(self.dataset)
         
-        # Get max task size
-        max_size = sampler.max_task_size
+        # Get the configured sample size from the sampler
+        sample_size = sampler.task_epoch_size
         
         # Create lookup: global index -> task name
         task_lookup = {
@@ -314,21 +323,21 @@ class TestDataLoaderWithRealData(unittest.TestCase):
             task_lookup[i] for i in indices
         )
         
-        print("\n--- Task Distribution in Epoch ---")
+        print("\n--- Task Distribution in Epoch (Default 'min' Mode) ---")
         for task in sorted(task_counts.keys()):
             print(f"{task:15s}: {task_counts[task]:,} samples")
-        print(f"{'Expected each':15s}: {max_size:,} samples\n")
+        print(f"{'Expected each':15s}: {sample_size:,} samples\n")
         
-        # Check that each task appears exactly max_size times
+        # Check that each task appears exactly sample_size times
         for task_name in sampler.task_names:
             self.assertEqual(
                 task_counts[task_name], 
-                max_size,
+                sample_size,
                 f"Task {task_name} not balanced correctly"
             )
         
         # Check total
-        self.assertEqual(len(indices), max_size * len(sampler.task_names))
+        self.assertEqual(len(indices), sample_size * len(sampler.task_names))
 
     def test_10_input_ids_tokenization(self):
         """Tests that input_ids are correctly tokenized."""

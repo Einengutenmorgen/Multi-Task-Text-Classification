@@ -3,7 +3,10 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader, SequentialSampler, random_split
+# Import Subset for manual splitting
+from torch.utils.data import DataLoader, SequentialSampler, Subset
+# Import sklearn's train_test_split
+from sklearn.model_selection import train_test_split
 from transformers import get_linear_schedule_with_warmup
 import numpy as np
 from sklearn.metrics import f1_score
@@ -12,6 +15,7 @@ import os
 import json
 
 # Import our custom modules
+import data_loading
 from data_loading import (
     UnifiedDataset, 
     TaskSampler, 
@@ -30,11 +34,14 @@ CONFIG = {
     "EPOCHS": 3,
     "BATCH_SIZE": 16,  # Adjust based on your VRAM
     "MAX_LENGTH": 128,
-    "BASE_LR": 1e-5,   # For the mxbai trunk
+    "BASE_LR": 1e-5,   # For the mxbai trunk (Set to None to freeze)
     "HEAD_LR": 1e-4,   # For our new classification heads
     "WEIGHT_DECAY": 0.01,
     "VALIDATION_SPLIT": 0.1, # 10% for validation
-    "CHECKPOINT_DIR": "./checkpoints"
+    "CHECKPOINT_DIR": "./checkpoints",
+    
+    # --- SAMPLER CONFIG ---
+    "EPOCH_SAMPLING_SIZE": None # Options: None (use min), int (e.g. 50000), "max" (use max)
 }
 
 # Define our 5 tasks
@@ -86,9 +93,14 @@ def train_one_epoch(model, dataloader, loss_fn, optimizer, scheduler, device):
         
         # 5. Backpropagation
         optimizer.zero_grad()
-        losses['total_loss'].backward()
-        optimizer.step()
-        scheduler.step()
+        # --- NaN GUARD ---
+        if not torch.isnan(losses['total_loss']):
+            losses['total_loss'].backward()
+            optimizer.step()
+            scheduler.step()
+        else:
+            print("WARNING: Skipping batch due to NaN total_loss.")
+        # ---------------
         
         # 6. Log losses
         total_loss_sum += losses['total_loss'].item()
@@ -144,18 +156,19 @@ def evaluate(model, dataloader, loss_fn, device):
             if task in ['jigsaw', 'goemotions']:
                 # Multi-label: active if first label is not -100
                 mask = task_labels[:, 0] != -100
+                if mask.sum() == 0: continue
                 # Get preds: Apply sigmoid and threshold
                 task_preds = (torch.sigmoid(task_logits[mask]) > 0.5).int()
             else:
                 # Multi-class: active if label is not -100
                 mask = task_labels != -100
+                if mask.sum() == 0: continue
                 # Get preds: Argmax
                 task_preds = torch.argmax(task_logits[mask], dim=1)
             
             # Store the active preds and labels
-            if mask.sum() > 0:
-                all_preds[task].append(task_preds.cpu().numpy())
-                all_labels[task].append(task_labels[mask].cpu().numpy())
+            all_preds[task].append(task_preds.cpu().numpy())
+            all_labels[task].append(task_labels[mask].cpu().numpy())
 
     # --- 5. Calculate Metrics ---
     metrics = {}
@@ -163,20 +176,19 @@ def evaluate(model, dataloader, loss_fn, device):
     for task in TASKS:
         if not all_labels[task]:
             print(f"Warning: No active samples found for task '{task}' in validation set.")
-            metrics[f'{task}_f1'] = 0.0
+            metrics[f'{task}_f1_macro'] = 0.0 # Use macro key
             continue
             
         # Concatenate all batch results
         task_all_labels = np.concatenate(all_labels[task])
         task_all_preds = np.concatenate(all_preds[task])
         
-        # Calculate Weighted F1
-        # 'weighted' accounts for label imbalance within each task
-        f1 = f1_score(task_all_labels, task_all_preds, average='weighted', zero_division=0)
-        metrics[f'{task}_f1'] = f1
+        # --- Use 'macro' average for imbalanced data ---
+        f1 = f1_score(task_all_labels, task_all_preds, average='macro', zero_division=0)
+        metrics[f'{task}_f1_macro'] = f1
         
     # Calculate the main metric: Average F1
-    metrics['avg_f1'] = np.mean(list(metrics.values()))
+    metrics['avg_f1_macro'] = np.mean(list(metrics.values()))
     
     return metrics
 
@@ -196,10 +208,28 @@ def main():
     label_counts = get_label_counts(SCHEMA)
     print(f"Discovered label counts: {label_counts}")
 
-    # Split the dataset
-    val_size = int(len(full_dataset) * CONFIG['VALIDATION_SPLIT'])
-    train_size = len(full_dataset) - val_size
-    train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size])
+    # =================== NEW STRATIFIED SPLIT ===================
+    print("Creating task-stratified train/val split...")
+
+    # 1. Get the list of all indices (0 to N-1)
+    all_indices = list(range(len(full_dataset)))
+    
+    # 2. Get the corresponding task name for each index (for stratification)
+    # This creates a list like ['jigsaw', 'jigsaw', ..., 'goemotions', ..., 'davidson', ...]
+    labels_for_stratify = [task_name for (task_name, _) in full_dataset.task_indices]
+
+    # 3. Use sklearn's train_test_split to get stratified indices
+    train_indices, val_indices = train_test_split(
+        all_indices,
+        test_size=CONFIG['VALIDATION_SPLIT'],
+        stratify=labels_for_stratify, # <-- Stratify by task name
+        random_state=42
+    )
+
+    # 4. Create PyTorch Subset objects from these indices
+    train_dataset = Subset(full_dataset, train_indices)
+    val_dataset = Subset(full_dataset, val_indices)
+    # ============================================================
 
     # --- This is the correct patching ---
     # Give the Subset the attributes our TaskSampler needs to find
@@ -213,7 +243,11 @@ def main():
 
     # --- 3. Create DataLoaders ---
     # Training: Use TaskSampler for balanced batches
-    train_sampler = TaskSampler(train_dataset)
+    print(f"Initializing TaskSampler with strategy: {CONFIG['EPOCH_SAMPLING_SIZE']}")
+    train_sampler = TaskSampler(
+        train_dataset,
+        epoch_sampling_size=CONFIG['EPOCH_SAMPLING_SIZE']
+    )
     train_loader = DataLoader(
         train_dataset,
         batch_size=CONFIG['BATCH_SIZE'],
@@ -230,22 +264,34 @@ def main():
         num_workers=2
     )
 
-    # --- 4. Initialize Model ---
+    # --- 4. Initialize Model (MODIFIED) ---
     print("Initializing MultiTaskModel...")
+    
+    # --- NEW: Determine if trunk should be frozen ---
+    freeze_trunk_bool = (CONFIG["BASE_LR"] is None)
+    if freeze_trunk_bool:
+        print("BASE_LR is None. Freezing trunk parameters.")
+    else:
+        print(f"BASE_LR is {CONFIG['BASE_LR']}. Trunk parameters will be fine-tuned.")
+    # ------------------------------------------------
+    
     model = MultiTaskModel(
-        model_name=CONFIG['MODEL_NAME'],
-        num_labels_jigsaw=label_counts['jigsaw'],
-        num_labels_goemotions=label_counts['goemotions'],
-        num_labels_davidson=label_counts['davidson'],
-        num_labels_olid=label_counts['olid'],
-        num_labels_rumour=label_counts['rumour']
+        model_name=CONFIG["MODEL_NAME"],
+        num_labels_jigsaw=len(data_loading.SCHEMA["jigsaw"]),
+        num_labels_goemotions=len(data_loading.SCHEMA["goemotions"]),
+        num_labels_davidson=len(data_loading.SCHEMA["davidson"]),
+        num_labels_olid=len(data_loading.SCHEMA["olid"]),
+        num_labels_rumour=len(data_loading.SCHEMA["rumour"]),
+        freeze_trunk=freeze_trunk_bool  # <-- Pass the new argument
     )
+
     model.to(device)
 
     # --- 5. Initialize Loss, Optimizer, and Scheduler ---
     loss_fn = MultiTaskLoss().to(device)
     
     # Get parameter groups for differential LR
+    # This now correctly handles the frozen/unfrozen trunk
     optimizer_params = model.get_optimizer_params(
         base_lr=CONFIG['BASE_LR'],
         head_lr=CONFIG['HEAD_LR']
@@ -286,12 +332,12 @@ def main():
         
         print(f"Epoch {epoch+1} Validation Metrics:")
         for task in TASKS:
-            print(f"  - {task.capitalize()} F1: {val_metrics[f'{task}_f1']:.4f}")
-        print(f"  - === Average F1: {val_metrics['avg_f1']:.4f} === ")
+            print(f"  - {task.capitalize()} F1 (Macro): {val_metrics[f'{task}_f1_macro']:.4f}")
+        print(f"  - === Average F1 (Macro): {val_metrics['avg_f1_macro']:.4f} === ")
         
         # --- 7. Checkpointing ---
-        if val_metrics['avg_f1'] > best_avg_f1:
-            best_avg_f1 = val_metrics['avg_f1']
+        if val_metrics['avg_f1_macro'] > best_avg_f1:
+            best_avg_f1 = val_metrics['avg_f1_macro']
             checkpoint_path = os.path.join(CONFIG['CHECKPOINT_DIR'], "best_model.pth")
             print(f"New best model! Saving checkpoint to {checkpoint_path}")
             torch.save(model.state_dict(), checkpoint_path)
@@ -305,6 +351,79 @@ def main():
     print(f"Best Average F1 Score: {best_avg_f1:.4f}")
     print(f"Best model saved to {os.path.join(CONFIG['CHECKPOINT_DIR'], 'best_model.pth')}")
 
+def initialize_training_objects(device):
+    """
+    Factory to initialize model, loss, and optimizer exactly as used in training.
+    (MODIFIED)
+    """
+    import data_loading
+    from model import MultiTaskModel
+    from loss import MultiTaskLoss
+
+    num_labels = {k: len(v) for k, v in data_loading.SCHEMA.items()}
+
+    # --- NEW: Add freeze logic ---
+    freeze_trunk_bool = (CONFIG["BASE_LR"] is None)
+    # -----------------------------
+
+    model = MultiTaskModel(
+        model_name=CONFIG["MODEL_NAME"],
+        num_labels_jigsaw=num_labels["jigsaw"],
+        num_labels_goemotions=num_labels["goemotions"],
+        num_labels_davidson=num_labels["davidson"],
+        num_labels_olid=num_labels["olid"],
+        num_labels_rumour=num_labels["rumour"],
+        freeze_trunk=freeze_trunk_bool # <-- Pass the new argument
+    ).to(device)
+
+    loss_fn = MultiTaskLoss().to(device)
+    
+    # --- NEW: Update optimizer init ---
+    # Get param groups correctly
+    optimizer_params = model.get_optimizer_params(
+        base_lr=CONFIG["BASE_LR"],
+        head_lr=CONFIG["HEAD_LR"]
+    )
+    optimizer = torch.optim.AdamW(
+        optimizer_params,
+        weight_decay=CONFIG['WEIGHT_DECAY']
+    )
+    # ----------------------------------
+
+    return model, loss_fn, optimizer
+
+
+def train_step(model, loss_fn, optimizer, batch):
+    model.train()
+    optimizer.zero_grad(set_to_none=True)
+
+    outputs = model(batch["input_ids"], batch["attention_mask"])
+    loss_dict = loss_fn(outputs, {k: v for k, v in batch.items() if k.startswith("labels_")})
+
+    if isinstance(loss_dict, dict):
+        for task, val in loss_dict.items():
+            if torch.isnan(val):
+                print(f"⚠️  NaN in loss for {task}: {val}")
+        loss = loss_dict.get('total_loss', sum(loss_dict.values()))
+    else:
+        loss = loss_dict
+
+    if torch.isnan(loss):
+        print("⚠️  NaN total loss! Inspect per-task above.")
+        for name, logits in outputs.items():
+            if torch.isnan(logits).any():
+                print(f"   -> NaN in logits for {name}")
+        for k, v in batch.items():
+            if k.startswith("labels_") and torch.isnan(v).any():
+                print(f"   -> NaN in labels for {k}")
+        for k, v in batch.items():
+            if k.startswith("labels_"):
+                print(f"{k}: min={v.min().item()}, max={v.max().item()}, dtype={v.dtype}")
+    else:
+        loss.backward()
+        optimizer.step()
+    
+    return loss
 
 if __name__ == "__main__":
     main()

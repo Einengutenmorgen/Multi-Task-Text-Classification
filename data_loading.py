@@ -12,7 +12,7 @@ import random
 import zipfile
 
 # --- Constants ---
-
+# (Constants... no changes)
 # 1. Jigsaw
 JIGSAW_PATH = '/Users/christophhau/Desktop/tweet_classifier/jigsaw/train.csv' # ASSUMES download_jigsaw.py creates this
 JIGSAW_TEXT_COL = 'comment_text'
@@ -63,7 +63,7 @@ SCHEMA = {
 }
 
 # --- Main Dataset Class ---
-
+# (UnifiedDataset class... no changes)
 class UnifiedDataset(Dataset):
     """
     Loads 5 distinct datasets for multi-task learning.
@@ -376,21 +376,24 @@ class UnifiedDataset(Dataset):
             'labels_rumour': labels_rumour
         }
 
-# --- Task-Based Sampler  ---
+# --- Task-Based Sampler (MODIFIED) ---
 
 class TaskSampler(Sampler):
     """
     Samples from all tasks to create a balanced "epoch".
-    Oversamples small datasets and undersamples large ones by
-    sampling with replacement from each task up to the size of the
-    largest task.
+    
+    Can be configured with `epoch_sampling_size`:
+    - `None` (default): Use the size of the *smallest* task. (Undersamples)
+    - `int`: Use a specific number as the size for each task. (Can over/undersample)
+    - `"max"`: Use the size of the *largest* task. (Oversamples - original behavior)
     
     This sampler is "Subset-aware". It can be initialized with:
     1. A full UnifiedDataset (used in testing)
     2. A torch.utils.data.Subset (used in train.py)
     """
-    def __init__(self, dataset):
+    def __init__(self, dataset, epoch_sampling_size=None):
         self.dataset = dataset
+        self.epoch_sampling_size_config = epoch_sampling_size
         
         # 1. Get task names. This works for both Subset (via patching)
         #    and the Full Dataset.
@@ -428,36 +431,62 @@ class TaskSampler(Sampler):
         # 3. Filter out any tasks that didn't end up in this split
         self.task_indices = {k: v for k, v in self.task_indices.items() if len(v) > 0}
         
-        # 4. (FIX) Define self.task_names (was missing, needed for __len__ and __iter__)
+        # 4. Define self.task_names
         self.task_names = list(self.task_indices.keys())
 
-        # 5. Find the size of the *largest* dataset
-        self.max_task_size = 0
-        if self.task_indices: # This line will no longer fail
-            self.max_task_size = max(len(indices) for indices in self.task_indices.values())
+        # 5. --- NEW LOGIC: Determine the sampling size ---
+        self.task_epoch_size = 0
+        if self.task_indices:
+            task_sizes = [len(indices) for indices in self.task_indices.values()]
+            
+            if self.epoch_sampling_size_config is None:
+                # Default: Use size of the *smallest* task
+                self.task_epoch_size = min(task_sizes)
+                print(f"TaskSampler: Using MIN task size: {self.task_epoch_size} samples per task")
+                
+            elif isinstance(self.epoch_sampling_size_config, int):
+                # Use the specified integer size
+                self.task_epoch_size = self.epoch_sampling_size_config
+                print(f"TaskSampler: Using FIXED size: {self.task_epoch_size} samples per task")
+
+            elif self.epoch_sampling_size_config == "max":
+                # Original behavior: Use size of the *largest* task
+                self.task_epoch_size = max(task_sizes)
+                print(f"TaskSampler: Using MAX task size: {self.task_epoch_size} samples per task")
+            else:
+                raise ValueError(f"Invalid epoch_sampling_size: {self.epoch_sampling_size_config}")
         
         # 6. Set the epoch size
-        self.epoch_size = self.max_task_size * len(self.task_names)
+        self.epoch_size = self.task_epoch_size * len(self.task_names)
         
     def __iter__(self):
         all_indices = []
-        if self.max_task_size == 0:
+        if self.task_epoch_size == 0:
             return iter(all_indices) # Return empty iterator if no data loaded
 
         for task_name in self.task_names:
-            # Oversample smaller tasks up to the size of the largest task
+            # Sample with replacement from each task up to the configured size
             indices = self.task_indices[task_name]
-            oversampled_indices = random.choices(indices, k=self.max_task_size)
-            all_indices.extend(oversampled_indices)
+            sampled_indices = random.choices(indices, k=self.task_epoch_size)
+            all_indices.extend(sampled_indices)
         
         # Shuffle all the indices together
         random.shuffle(all_indices)
         return iter(all_indices)
 
     def __len__(self):
-        # The length of one "epoch" is all tasks oversampled to the max size
+        # The length of one "epoch" is all tasks sampled to the configured size
         return self.epoch_size
-# --- Example Usage (How to test this file) ---
+    
+def get_dataloader_for_task(task_name, tokenizer_name, max_length, batch_size, max_batches=3):
+    """Helper to get a small DataLoader for one task, for tests or sanity checks."""
+    from torch.utils.data import DataLoader, Subset
+
+    dataset = UnifiedDataset(tokenizer_name=tokenizer_name, max_length=max_length)
+    task_indices = [i for i, (t, _) in enumerate(dataset.task_indices) if t == task_name]
+    subset = Subset(dataset, task_indices[:batch_size * max_batches])
+    return DataLoader(subset, batch_size=batch_size)
+
 if __name__ == "__main__":
     
     print("--- Initializing Tokenizer and Dataset ---")
@@ -472,15 +501,27 @@ if __name__ == "__main__":
     # 3. Create the Task-Balancing Sampler
     #    This is for training. For validation, use a standard SequentialSampler.
     batch_size = 8
-    sampler = TaskSampler(dataset)
     
-    # 4. Create the DataLoader
+    # --- Test new sampler options ---
+    print("\n--- Testing Sampler (DEFAULT: min size) ---")
+    sampler_min = TaskSampler(dataset, epoch_sampling_size=None)
+    print(f"Epoch size (min): {len(sampler_min)}")
+
+    print("\n--- Testing Sampler (FIXED size) ---")
+    sampler_fixed = TaskSampler(dataset, epoch_sampling_size=10000)
+    print(f"Epoch size (10k): {len(sampler_fixed)}")
+
+    print("\n--- Testing Sampler (MAX size) ---")
+    sampler_max = TaskSampler(dataset, epoch_sampling_size="max")
+    print(f"Epoch size (max): {len(sampler_max)}")
+    
+    # 4. Create the DataLoader (using default 'min' sampler)
     from torch.utils.data import DataLoader
     # Use num_workers > 0 for faster loading
-    dataloader = DataLoader(dataset, batch_size=batch_size, sampler=sampler, num_workers=0) # Set num_workers=0 for simple debugging
+    dataloader = DataLoader(dataset, batch_size=batch_size, sampler=sampler_min, num_workers=0) # Set num_workers=0 for simple debugging
     
     # 5. Check a batch
-    print("\n--- Testing DataLoader ---")
+    print("\n--- Testing DataLoader (with 'min' sampler) ---")
     try:
         # The DataLoader now yields a collated batch dictionary
         batch = next(iter(dataloader))
@@ -509,4 +550,3 @@ if __name__ == "__main__":
         print(f"\nAn error occurred while testing the loader: {e}")
         import traceback
         traceback.print_exc()
-

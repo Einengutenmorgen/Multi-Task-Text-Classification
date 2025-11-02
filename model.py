@@ -14,7 +14,8 @@ class MultiTaskModel(nn.Module):
                  num_labels_goemotions: int,
                  num_labels_davidson: int,
                  num_labels_olid: int,
-                 num_labels_rumour: int):
+                 num_labels_rumour: int,
+                 freeze_trunk: bool = True): # <-- NEW ARGUMENT
         
         super().__init__()
         
@@ -22,6 +23,14 @@ class MultiTaskModel(nn.Module):
         # We use AutoConfig to get the hidden_size
         config = AutoConfig.from_pretrained(model_name)
         self.trunk = AutoModel.from_pretrained(model_name)
+        
+        # --- NEW: Conditionally freeze the trunk ---
+        if freeze_trunk:
+            for param in self.trunk.parameters():
+                param.requires_grad = False
+        # If freeze_trunk is False, params will require_grad by default
+        # -------------------------------------------
+        
         
         # Get the output dimension from the trunk's config
         hidden_size = config.hidden_size # For mxbai-embed-large-v1, this is 1024
@@ -81,12 +90,11 @@ class MultiTaskModel(nn.Module):
 
     def get_optimizer_params(self, base_lr: float, head_lr: float):
         """
-        Returns optimizer parameters with differential learning rates,
-        as discussed with your coworker.
-        """
-        # Get all parameters from the trunk
-        trunk_params = self.trunk.parameters()
+        Returns optimizer parameters with differential learning rates.
         
+        If the trunk is frozen (requires_grad=False), its parameters
+        are not added to the optimizer.
+        """
         # Get all parameters from the 5 heads
         head_parameters = (
             list(self.head_jigsaw.parameters()) +
@@ -96,13 +104,19 @@ class MultiTaskModel(nn.Module):
             list(self.head_rumour.parameters())
         )
         
-        # Set up the two parameter groups
+        # Set up the parameter groups
         optimizer_params = [
-            # Group 1: Trunk parameters with a low learning rate
-            {'params': trunk_params, 'lr': base_lr},
-            
-            # Group 2: Head parameters with a high learning rate
+            # Group 1: Head parameters (always trained)
             {'params': head_parameters, 'lr': head_lr}
         ]
+        
+        # --- NEW: Only add trunk if it's not frozen ---
+        # We check if the parameters actually require gradients.
+        if self.trunk.parameters().__next__().requires_grad:
+            optimizer_params.append(
+                # Group 2: Trunk parameters (conditionally trained)
+                {'params': self.trunk.parameters(), 'lr': base_lr}
+            )
+        # ----------------------------------------------
         
         return optimizer_params
