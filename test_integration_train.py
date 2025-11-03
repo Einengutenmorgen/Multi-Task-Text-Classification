@@ -13,18 +13,19 @@ TASKS_TO_TEST = ["davidson", "olid", "rumour"]
 @pytest.mark.parametrize("task_name", TASKS_TO_TEST)
 def test_diagnostic_single_task_batch_behavior(task_name):
     """
-    Diagnostic test: checks that a single-task batch produces:
+    Diagnostic test (MODIFIED): checks that a single-task batch produces:
     1. A valid loss for the TARGET task.
-    2. A NaN loss for OTHER CrossEntropy tasks.
+    2. A loss of 0.0 for OTHER CrossEntropy tasks.
     3. A loss of 0.0 for the robust BCE tasks.
-    4. A NaN loss for total_loss.
+    4. A total_loss equal to the target task's loss.
     
-    This confirms our understanding of nn.CrossEntropyLoss and our custom BCE loss.
+    This confirms our robust loss functions work as intended.
     """
     print(f"\n===== Diagnostic Test: {task_name} =====")
 
     tokenizer_name = train.CONFIG.get("MODEL_NAME", "distilbert-base-uncased")
-    max_length = train.CONFIG.get("MAX_LENGTH", 128)
+    # --- Use the CONFIG from train.py ---
+    max_length = train.CONFIG.get("MAX_LENGTH", 256) 
     batch_size = train.CONFIG.get("BATCH_SIZE", 8)
 
     # 1. Get a batch with data from *only* one task
@@ -47,22 +48,22 @@ def test_diagnostic_single_task_batch_behavior(task_name):
     # Get the full loss dictionary
     loss_dict = loss_fn(outputs, {k: v for k, v in batch.items() if k.startswith("labels_")})
 
-    # --- Assertions ---
+    # --- Assertions (MODIFIED) ---
     
-    # 1. The target task's loss should be a valid number
+    # 1. The target task's loss should be a valid number > 0
     target_loss = loss_dict[f'loss_{task_name}']
     print(f"  - Target loss ({task_name}): {target_loss.item()}")
     assert not torch.isnan(target_loss), f"Target task {task_name} unexpectedly had a NaN loss."
+    assert target_loss.item() > 0, "Target task loss was not positive."
 
-    # 2. The *other* CE tasks (which are all -100) should have NaN loss
+    # 2. The *other* CE tasks (which are all -100) should have 0.0 loss
     other_ce_tasks = [t for t in TASKS_TO_TEST if t != task_name]
     for other_task in other_ce_tasks:
         other_loss = loss_dict[f'loss_{other_task}']
         print(f"  - Other CE loss ({other_task}): {other_loss.item()}")
-        assert torch.isnan(other_loss), f"Other CE task {other_task} did not have expected NaN loss."
+        assert other_loss.item() == 0.0, f"Other CE task {other_task} did not have expected 0.0 loss."
     
     # 3. The BCE tasks (jigsaw, goemotions) should have a loss of 0.0
-    #    This confirms our custom BCE loss is robust to all-masked batches.
     bce_loss_jigsaw = loss_dict['loss_jigsaw']
     bce_loss_goemotions = loss_dict['loss_goemotions']
     print(f"  - Jigsaw loss (BCE): {bce_loss_jigsaw.item()}")
@@ -70,12 +71,14 @@ def test_diagnostic_single_task_batch_behavior(task_name):
     assert bce_loss_jigsaw.item() == 0.0, "Jigsaw loss was not 0.0 on a masked batch."
     assert bce_loss_goemotions.item() == 0.0, "GoEmotions loss was not 0.0 on a masked batch."
 
-    # 4. The total loss should be NaN (because (valid + 0 + 0 + nan + nan) / 5 = nan)
+    # 4. The total loss should be equal to the target loss
+    # (because we now average by *active* tasks)
     total_loss = loss_dict['total_loss']
     print(f"  - Total loss: {total_loss.item()}")
-    assert torch.isnan(total_loss), "Total loss was not NaN as expected for a single-task batch."
-
-
+    assert not torch.isnan(total_loss), "Total loss was NaN. This should not happen."
+    # Use torch.isclose for safe float comparison
+    assert torch.isclose(total_loss, target_loss), "Total loss was not equal to the single active task loss."
+    
 def test_training_with_tasksampler_no_nan():
     """
     Integration test: checks that a mixed-task batch from the

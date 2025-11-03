@@ -32,15 +32,13 @@ from loss import MultiTaskLoss
 CONFIG = {
     "MODEL_NAME": "mixedbread-ai/mxbai-embed-large-v1",
     "EPOCHS": 3,
-    "BATCH_SIZE": 16,  # Adjust based on your VRAM
-    "MAX_LENGTH": 128,
-    "BASE_LR": 1e-5,   # For the mxbai trunk (Set to None to freeze)
+    "BATCH_SIZE": 8,  # Adjust based on your VRAM
+    "MAX_LENGTH": 256,
+    "BASE_LR": None,   # For the mxbai trunk (Set to None to freeze)
     "HEAD_LR": 1e-4,   # For our new classification heads
     "WEIGHT_DECAY": 0.01,
     "VALIDATION_SPLIT": 0.1, # 10% for validation
     "CHECKPOINT_DIR": "./checkpoints",
-    
-    # --- SAMPLER CONFIG ---
     "EPOCH_SAMPLING_SIZE": None # Options: None (use min), int (e.g. 50000), "max" (use max)
 }
 
@@ -93,15 +91,17 @@ def train_one_epoch(model, dataloader, loss_fn, optimizer, scheduler, device):
         
         # 5. Backpropagation
         optimizer.zero_grad()
-        # --- NaN GUARD ---
-        if not torch.isnan(losses['total_loss']):
-            losses['total_loss'].backward()
-            optimizer.step()
-            scheduler.step()
-        else:
-            print("WARNING: Skipping batch due to NaN total_loss.")
+        # # --- NaN GUARD ---
+        # if not torch.isnan(losses['total_loss']):
+        #     losses['total_loss'].backward()
+        #     optimizer.step()
+        #     scheduler.step()
+        # else:
+        #     print("WARNING: Skipping batch due to NaN total_loss.")
         # ---------------
-        
+        losses['total_loss'].backward()
+        optimizer.step()
+        scheduler.step()
         # 6. Log losses
         total_loss_sum += losses['total_loss'].item()
         for task in TASKS:

@@ -47,6 +47,7 @@ von:    wget -P data/full_dataset/ https://storage.googleapis.com/gresearch/goem
         wget -P data/full_dataset/ https://storage.googleapis.com/gresearch/goemotions/data/full_dataset/goemotions_2.csv
         wget -P data/full_dataset/ https://storage.googleapis.com/gresearch/goemotions/data/full_dataset/goemotions_3.csv
 saved as: goEmotions
+
 ### file-structure 
 3 csv dateien mit den folgenden columns:
 text,id,author,subreddit,link_id,parent_id,created_utc,rater_id,example_very_unclear,admiration,amusement,anger,annoyance,approval,caring,confusion,curiosity,desire,disappointment,disapproval,disgust,embarrassment,excitement,fear,gratitude,grief,joy,love,nervousness,optimism,pride,realization,relief,remorse,sadness,surprise,neutral
@@ -60,7 +61,7 @@ text,id,author,subreddit,link_id,parent_id,created_utc,rater_id,example_very_unc
 
 - Model Type: Multi-Task Learning (MTL) with a Hard Parameter Sharing architecture.
 
-- Shared Trunk: The model uses a shared trunk based on transformers.AutoModel. The specific pre-trained model is mixedbread-ai/mxbai-embed-large-v1.
+- Shared Trunk: The model uses a shared trunk based on transformers.AutoModel. The specific pre-trained model is **mixedbread-ai/mxbai-embed-large-v1**.
 
 - Trunk State: The parameters of the shared trunk are frozen (param.requires_grad = False). Only the task-specific heads are trained.
 
