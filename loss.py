@@ -3,6 +3,7 @@
 import torch
 import torch.nn as nn
 
+
 class MultiTaskLoss(nn.Module):
     """
     Computes the loss for our multi-task model.
@@ -13,27 +14,55 @@ class MultiTaskLoss(nn.Module):
     3. Manually masking BOTH loss types to respect the -100 ignore_index.
     4. Averaging only the *active* task losses to get a single total_loss.
     """
-    def __init__(self):
+    def __init__(self, ce_weights=None, bce_pos_weights=None):
         super().__init__()
-        
+
+        ce_weights = ce_weights or {}
+        bce_pos_weights = bce_pos_weights or {}
+
         # --- Loss Functions ---
-        
+
         # 1. For Multi-Class tasks (Davidson, OLID, Rumour)
-        # --- MODIFIED: Use reduction="none" to get per-element loss ---
-        self.loss_ce = nn.CrossEntropyLoss(ignore_index=-100, reduction="none")
-        
+        # Each task can have a different weight vector size, so instantiate separately.
+        self.loss_ce = {
+            'davidson': nn.CrossEntropyLoss(
+                ignore_index=-100,
+                reduction="none",
+                weight=ce_weights.get('davidson')
+            ),
+            'olid': nn.CrossEntropyLoss(
+                ignore_index=-100,
+                reduction="none",
+                weight=ce_weights.get('olid')
+            ),
+            'rumour': nn.CrossEntropyLoss(
+                ignore_index=-100,
+                reduction="none",
+                weight=ce_weights.get('rumour')
+            )
+        }
+
         # 2. For Multi-Label tasks (Jigsaw, GoEmotions)
         # We MUST use 'reduction="none"' to get the per-element loss.
         # This allows us to manually apply a mask *before* averaging.
-        self.loss_bce = nn.BCEWithLogitsLoss(reduction="none")
+        self.loss_bce = {
+            'jigsaw': nn.BCEWithLogitsLoss(
+                reduction="none",
+                pos_weight=bce_pos_weights.get('jigsaw')
+            ),
+            'goemotions': nn.BCEWithLogitsLoss(
+                reduction="none",
+                pos_weight=bce_pos_weights.get('goemotions')
+            )
+        }
 
-    def _compute_bce_loss(self, logits, labels):
+    def _compute_bce_loss(self, task_name, logits, labels):
         """
         Computes a masked BCE loss.
         (This function is already robust and correct)
         """
         # 1. Get the per-element loss
-        per_element_loss = self.loss_bce(logits, labels)
+        per_element_loss = self.loss_bce[task_name](logits, labels)
         
         # 2. Create a mask for *active* samples.
         mask = (labels[:, 0] != -100).float()
@@ -57,7 +86,7 @@ class MultiTaskLoss(nn.Module):
         return total_loss
 
     # --- NEW: Robust helper function for Cross-Entropy Loss ---
-    def _compute_ce_loss(self, logits, labels):
+    def _compute_ce_loss(self, task_name, logits, labels):
         """
         Computes a masked Cross-Entropy loss.
         
@@ -70,7 +99,7 @@ class MultiTaskLoss(nn.Module):
         """
         # 1. Get the per-element loss
         # Shape: (batch_size,)
-        per_element_loss = self.loss_ce(logits, labels)
+        per_element_loss = self.loss_ce[task_name](logits, labels)
         
         # 2. Create a mask for *active* samples
         # Shape: (batch_size,)
@@ -100,24 +129,29 @@ class MultiTaskLoss(nn.Module):
         # --- 1. Multi-Class Losses (MODIFIED) ---
         # Use our new robust _compute_ce_loss helper
         loss_davidson = self._compute_ce_loss(
-            model_outputs['davidson'], 
+            'davidson',
+            model_outputs['davidson'],
             batch_labels['labels_davidson']
         )
         loss_olid = self._compute_ce_loss(
-            model_outputs['olid'], 
+            'olid',
+            model_outputs['olid'],
             batch_labels['labels_olid']
         )
         loss_rumour = self._compute_ce_loss(
-            model_outputs['rumour'], 
+            'rumour',
+            model_outputs['rumour'],
             batch_labels['labels_rumour']
         )
-        
+
         # --- 2. Multi-Label Losses (Unchanged) ---
         loss_jigsaw = self._compute_bce_loss(
+            'jigsaw',
             model_outputs['jigsaw'],
             batch_labels['labels_jigsaw']
         )
         loss_goemotions = self._compute_bce_loss(
+            'goemotions',
             model_outputs['goemotions'],
             batch_labels['labels_goemotions']
         )
