@@ -3,7 +3,6 @@
 import torch
 import torch.nn as nn
 
-
 class MultiTaskLoss(nn.Module):
     """
     Computes the loss for our multi-task model.
@@ -15,16 +14,31 @@ class MultiTaskLoss(nn.Module):
     4. Averaging only the *active* task losses to get a single total_loss.
     """
     def __init__(self, ce_weights=None, bce_pos_weights=None):
-        super().__init__()
+        """
+        Initializes the loss module.
 
-        ce_weights = ce_weights or {}
-        bce_pos_weights = bce_pos_weights or {}
+        Args:
+            ce_weights (dict, optional): A dictionary mapping task names 
+                ('davidson', 'olid', 'rumour') to weight tensors for CE loss.
+                Tensors should be on the CPU; they will be moved by .to(device).
+            bce_pos_weights (dict, optional): A dictionary mapping task names
+                ('jigsaw', 'goemotions') to pos_weight tensors for BCE loss.
+                Tensors should be on the CPU; they will be moved by .to(device).
+        """
+        super().__init__()
+        
+        # --- Handle default weights if none provided ---
+        if ce_weights is None:
+            ce_weights = {'davidson': None, 'olid': None, 'rumour': None}
+        if bce_pos_weights is None:
+            bce_pos_weights = {'jigsaw': None, 'goemotions': None}
 
         # --- Loss Functions ---
-
+        
         # 1. For Multi-Class tasks (Davidson, OLID, Rumour)
-        # Each task can have a different weight vector size, so instantiate separately.
-        self.loss_ce = {
+        # --- MODIFIED: Use nn.ModuleDict to register sub-modules ---
+        # This ensures that .to(device) correctly moves the weight tensors.
+        self.loss_ce = nn.ModuleDict({
             'davidson': nn.CrossEntropyLoss(
                 ignore_index=-100,
                 reduction="none",
@@ -40,12 +54,11 @@ class MultiTaskLoss(nn.Module):
                 reduction="none",
                 weight=ce_weights.get('rumour')
             )
-        }
-
+        })
+        
         # 2. For Multi-Label tasks (Jigsaw, GoEmotions)
-        # We MUST use 'reduction="none"' to get the per-element loss.
-        # This allows us to manually apply a mask *before* averaging.
-        self.loss_bce = {
+        # --- MODIFIED: Use nn.ModuleDict ---
+        self.loss_bce = nn.ModuleDict({
             'jigsaw': nn.BCEWithLogitsLoss(
                 reduction="none",
                 pos_weight=bce_pos_weights.get('jigsaw')
@@ -54,12 +67,11 @@ class MultiTaskLoss(nn.Module):
                 reduction="none",
                 pos_weight=bce_pos_weights.get('goemotions')
             )
-        }
+        })
 
-    def _compute_bce_loss(self, task_name, logits, labels):
+    def _compute_bce_loss(self, logits, labels, task_name):
         """
         Computes a masked BCE loss.
-        (This function is already robust and correct)
         """
         # 1. Get the per-element loss
         per_element_loss = self.loss_bce[task_name](logits, labels)
@@ -86,13 +98,14 @@ class MultiTaskLoss(nn.Module):
         return total_loss
 
     # --- NEW: Robust helper function for Cross-Entropy Loss ---
-    def _compute_ce_loss(self, task_name, logits, labels):
+    def _compute_ce_loss(self, logits, labels, task_name):
         """
         Computes a masked Cross-Entropy loss.
         
         Args:
             logits (torch.Tensor): Logits from the model (batch_size, num_classes)
             labels (torch.Tensor): Labels from the dataloader (batch_size,)
+            task_name (str): The name of the task ('davidson', 'olid', 'rumour')
         
         Returns:
             torch.Tensor: A single scalar loss value for the active samples.
@@ -129,31 +142,31 @@ class MultiTaskLoss(nn.Module):
         # --- 1. Multi-Class Losses (MODIFIED) ---
         # Use our new robust _compute_ce_loss helper
         loss_davidson = self._compute_ce_loss(
-            'davidson',
-            model_outputs['davidson'],
-            batch_labels['labels_davidson']
+            model_outputs['davidson'], 
+            batch_labels['labels_davidson'],
+            'davidson' # <-- Pass task name
         )
         loss_olid = self._compute_ce_loss(
-            'olid',
-            model_outputs['olid'],
-            batch_labels['labels_olid']
+            model_outputs['olid'], 
+            batch_labels['labels_olid'],
+            'olid' # <-- Pass task name
         )
         loss_rumour = self._compute_ce_loss(
-            'rumour',
-            model_outputs['rumour'],
-            batch_labels['labels_rumour']
+            model_outputs['rumour'], 
+            batch_labels['labels_rumour'],
+            'rumour' # <-- Pass task name
         )
-
-        # --- 2. Multi-Label Losses (Unchanged) ---
+        
+        # --- 2. Multi-Label Losses (MODIFIED) ---
         loss_jigsaw = self._compute_bce_loss(
-            'jigsaw',
             model_outputs['jigsaw'],
-            batch_labels['labels_jigsaw']
+            batch_labels['labels_jigsaw'],
+            'jigsaw' # <-- Pass task name
         )
         loss_goemotions = self._compute_bce_loss(
-            'goemotions',
             model_outputs['goemotions'],
-            batch_labels['labels_goemotions']
+            batch_labels['labels_goemotions'],
+            'goemotions' # <-- Pass task name
         )
         
         # --- 3. Total Loss (MODIFIED: Robust Averaging) ---

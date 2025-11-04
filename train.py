@@ -38,7 +38,7 @@ CONFIG = {
     "HEAD_LR": 1e-4,   # For our new classification heads
     "WEIGHT_DECAY": 0.01,
     "VALIDATION_SPLIT": 0.1, # 10% for validation
-    "CHECKPOINT_DIR": "./checkpoints",
+    "CHECKPOINT_DIR": "./checkpoints/v2/",
     "EPOCH_SAMPLING_SIZE": None # Options: None (use min), int (e.g. 50000), "max" (use max)
 }
 
