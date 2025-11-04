@@ -17,12 +17,12 @@ import json
 # Import our custom modules
 import data_loading
 from data_loading import (
-    UnifiedDataset, 
-    TaskSampler, 
-    SCHEMA, 
-    JIGSAW_LABEL_COLS, 
-    DAVIDSON_LABEL_MAP, 
-    OLID_LABEL_MAP, 
+    UnifiedDataset,
+    TaskSampler,
+    SCHEMA,
+    JIGSAW_LABEL_COLS,
+    DAVIDSON_LABEL_MAP,
+    OLID_LABEL_MAP,
     RUMOUR_LABEL_MAP
 )
 from model import MultiTaskModel
@@ -47,10 +47,10 @@ TASKS = ['jigsaw', 'goemotions', 'davidson', 'olid', 'rumour']
 
 def get_label_counts(dataset_schema):
     """Gets the number of labels for each task from our schema."""
-    
+
     # We must access the *loaded* schema from the dataset instance
     # because 'goemotions' is auto-detected.
-    
+
     return {
         'jigsaw': len(JIGSAW_LABEL_COLS),
         'goemotions': len(dataset_schema['goemotions']),
@@ -58,6 +58,65 @@ def get_label_counts(dataset_schema):
         'olid': len(OLID_LABEL_MAP),
         'rumour': len(RUMOUR_LABEL_MAP)
     }
+
+
+def compute_task_class_weights(dataset, indices, label_counts):
+    """Compute class and positive weights for each task using the training subset."""
+
+    ce_tasks = ['davidson', 'olid', 'rumour']
+    bce_tasks = ['jigsaw', 'goemotions']
+
+    ce_counts = {
+        task: torch.zeros(label_counts[task], dtype=torch.float32)
+        for task in ce_tasks
+    }
+
+    bce_positive_counts = {
+        task: torch.zeros(label_counts[task], dtype=torch.float32)
+        for task in bce_tasks
+    }
+    bce_total_counts = {task: 0 for task in bce_tasks}
+
+    for idx in indices:
+        task_name, item_idx = dataset.task_indices[idx]
+        labels = dataset.task_data[task_name]['labels'][item_idx]
+
+        if task_name in ce_counts:
+            label_idx = int(labels)
+            if 0 <= label_idx < ce_counts[task_name].numel():
+                ce_counts[task_name][label_idx] += 1
+        elif task_name in bce_positive_counts:
+            label_tensor = torch.tensor(labels, dtype=torch.float32)
+            bce_positive_counts[task_name] += label_tensor
+            bce_total_counts[task_name] += 1
+
+    ce_weights = {}
+    for task, counts in ce_counts.items():
+        total = counts.sum()
+        if total > 0:
+            weights = torch.where(
+                counts > 0,
+                total / torch.clamp(counts, min=1e-6),
+                torch.zeros_like(counts)
+            )
+        else:
+            weights = torch.ones_like(counts)
+        ce_weights[task] = weights
+
+    bce_pos_weights = {}
+    for task, pos_counts in bce_positive_counts.items():
+        total_samples = bce_total_counts[task]
+        if total_samples > 0:
+            weights = torch.where(
+                pos_counts > 0,
+                total_samples / torch.clamp(pos_counts, min=1e-6),
+                torch.zeros_like(pos_counts)
+            )
+        else:
+            weights = torch.ones_like(pos_counts)
+        bce_pos_weights[task] = weights
+
+    return ce_weights, bce_pos_weights
 
 def batch_to_device(batch, device):
     """Moves all tensor values in a batch dictionary to the specified device."""
@@ -241,6 +300,13 @@ def main():
     print(f"Training samples: {len(train_dataset)}")
     print(f"Validation samples: {len(val_dataset)}")
 
+    # --- Compute class weights for loss balancing ---
+    ce_weights, bce_pos_weights = compute_task_class_weights(
+        full_dataset,
+        train_indices,
+        label_counts
+    )
+
     # --- 3. Create DataLoaders ---
     # Training: Use TaskSampler for balanced batches
     print(f"Initializing TaskSampler with strategy: {CONFIG['EPOCH_SAMPLING_SIZE']}")
@@ -288,7 +354,10 @@ def main():
     model.to(device)
 
     # --- 5. Initialize Loss, Optimizer, and Scheduler ---
-    loss_fn = MultiTaskLoss().to(device)
+    loss_fn = MultiTaskLoss(
+        ce_weights=ce_weights,
+        bce_pos_weights=bce_pos_weights
+    ).to(device)
     
     # Get parameter groups for differential LR
     # This now correctly handles the frozen/unfrozen trunk
@@ -351,7 +420,7 @@ def main():
     print(f"Best Average F1 Score: {best_avg_f1:.4f}")
     print(f"Best model saved to {os.path.join(CONFIG['CHECKPOINT_DIR'], 'best_model.pth')}")
 
-def initialize_training_objects(device):
+def initialize_training_objects(device, ce_weights=None, bce_pos_weights=None):
     """
     Factory to initialize model, loss, and optimizer exactly as used in training.
     (MODIFIED)
@@ -376,7 +445,10 @@ def initialize_training_objects(device):
         freeze_trunk=freeze_trunk_bool # <-- Pass the new argument
     ).to(device)
 
-    loss_fn = MultiTaskLoss().to(device)
+    loss_fn = MultiTaskLoss(
+        ce_weights=ce_weights,
+        bce_pos_weights=bce_pos_weights
+    ).to(device)
     
     # --- NEW: Update optimizer init ---
     # Get param groups correctly
