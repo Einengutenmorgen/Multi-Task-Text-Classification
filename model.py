@@ -39,20 +39,53 @@ class MultiTaskModel(nn.Module):
         # We add a Dropout layer for regularization, a good practice.
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
         
+        # Determine the intermediate size for task-specific heads
+        intermediate_size = max(1, hidden_size // 2)
+
         # Head for Jigsaw (Multi-Label)
-        self.head_jigsaw = nn.Linear(hidden_size, num_labels_jigsaw)
-        
+        self.head_jigsaw = nn.Sequential(
+            nn.Dropout(config.hidden_dropout_prob),
+            nn.Linear(hidden_size, intermediate_size),
+            nn.ReLU(),
+            nn.Dropout(config.hidden_dropout_prob),
+            nn.Linear(intermediate_size, num_labels_jigsaw)
+        )
+
         # Head for GoEmotions (Multi-Label)
-        self.head_goemotions = nn.Linear(hidden_size, num_labels_goemotions)
-        
+        self.head_goemotions = nn.Sequential(
+            nn.Dropout(config.hidden_dropout_prob),
+            nn.Linear(hidden_size, intermediate_size),
+            nn.ReLU(),
+            nn.Dropout(config.hidden_dropout_prob),
+            nn.Linear(intermediate_size, num_labels_goemotions)
+        )
+
         # Head for Davidson (Multi-Class)
-        self.head_davidson = nn.Linear(hidden_size, num_labels_davidson)
-        
+        self.head_davidson = nn.Sequential(
+            nn.Dropout(config.hidden_dropout_prob),
+            nn.Linear(hidden_size, intermediate_size),
+            nn.ReLU(),
+            nn.Dropout(config.hidden_dropout_prob),
+            nn.Linear(intermediate_size, num_labels_davidson)
+        )
+
         # Head for OLID (Multi-Class)
-        self.head_olid = nn.Linear(hidden_size, num_labels_olid)
-        
+        self.head_olid = nn.Sequential(
+            nn.Dropout(config.hidden_dropout_prob),
+            nn.Linear(hidden_size, intermediate_size),
+            nn.ReLU(),
+            nn.Dropout(config.hidden_dropout_prob),
+            nn.Linear(intermediate_size, num_labels_olid)
+        )
+
         # Head for Rumour (Multi-Class)
-        self.head_rumour = nn.Linear(hidden_size, num_labels_rumour)
+        self.head_rumour = nn.Sequential(
+            nn.Dropout(config.hidden_dropout_prob),
+            nn.Linear(hidden_size, intermediate_size),
+            nn.ReLU(),
+            nn.Dropout(config.hidden_dropout_prob),
+            nn.Linear(intermediate_size, num_labels_rumour)
+        )
 
     def forward(self, input_ids, attention_mask):
         """
