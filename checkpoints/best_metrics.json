@@ -1,8 +1,8 @@
 {
-  "jigsaw_f1_macro": 0.1549442326352375,
-  "goemotions_f1_macro": 0.00020786779608169206,
-  "davidson_f1_macro": 0.5422835221202961,
-  "olid_f1_macro": 0.8170846394984326,
-  "rumour_f1_macro": 0.2153153153153153,
-  "avg_f1_macro": 0.3459671154730727
+  "jigsaw_f1_macro": 0.2656986223254943,
+  "goemotions_f1_macro": 0.016650958519474422,
+  "davidson_f1_macro": 0.6102332214533844,
+  "olid_f1_macro": 0.8481397243533166,
+  "rumour_f1_macro": 0.21627697841726617,
+  "avg_f1_macro": 0.3913999010137872
 }
