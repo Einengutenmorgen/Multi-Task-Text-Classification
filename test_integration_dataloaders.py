@@ -50,7 +50,7 @@ class TestDataLoaderWithRealData(unittest.TestCase):
         
         # Store counts for validation
         cls.task_counts = {
-            task: len(data['texts']) 
+            task: len(data['content']) 
             for task, data in cls.dataset.task_data.items()
         }
         
@@ -197,7 +197,7 @@ class TestDataLoaderWithRealData(unittest.TestCase):
         self.assertEqual(sample['labels_rumour'].item(), -100)
 
     def test_06_getitem_rumour(self):
-        """Tests a RumourEval sample (text_a + text_b)."""
+        """Tests a RumourEval sample (context + content)."""
         self._skip_if_task_empty('rumour')
         
         idx = self._find_task_sample('rumour')
@@ -212,12 +212,12 @@ class TestDataLoaderWithRealData(unittest.TestCase):
         self.assertEqual(sample['labels_davidson'].item(), -100)
         self.assertTrue(torch.all(sample['labels_jigsaw'] == -100))
         
-        # Check tokenization includes [SEP] token (for text_a + text_b)
+        # Check tokenization includes [SEP] token (for context + content)
         decoded = self.dataset.tokenizer.decode(
             sample['input_ids'], 
             skip_special_tokens=False
         )
-        self.assertIn("[SEP]", decoded)
+        self.assertEqual(decoded.count("[SEP]"), 2, "Should have two [SEP] tokens")
 
     # --- MODIFIED TEST ---
     def test_07_task_sampler_epoch_length(self):
@@ -227,9 +227,11 @@ class TestDataLoaderWithRealData(unittest.TestCase):
         
         # Find min task size manually
         min_size = min(
-            len(self.dataset.task_data[task]['texts'])
+            # --- FIX: Use 'content' ---
+            len(self.dataset.task_data[task]['content'])
             for task in sampler.task_names
-            if len(self.dataset.task_data[task]['texts']) > 0 # Ensure task is not empty
+            if len(self.dataset.task_data[task]['content']) > 0 # Ensure task is not empty
+            # --- END FIX ---
         )
         
         num_tasks = len(sampler.task_names)
@@ -436,7 +438,9 @@ class TestDatasetSchema(unittest.TestCase):
         """Tests that SCHEMA matches actual label dimensions."""
         # For multi-label tasks
         for task in ['jigsaw', 'goemotions']:
-            if len(self.dataset.task_data[task]['texts']) > 0:
+            # --- FIX: Use 'content' ---
+            if len(self.dataset.task_data[task]['content']) > 0:
+            # --- END FIX ---
                 first_sample_labels = self.dataset.task_data[task]['labels'][0]
                 schema_size = len(data_loading.SCHEMA[task])
                 
@@ -465,7 +469,6 @@ if __name__ == '__main__':
     print("- All datasets must be downloaded")
     print("- Paths in data_loading.py must be correct")
     print("- This will take several minutes to run")
-    print("="*70 + "\n")
-    
+    print("="*70)
     # Run tests with verbose output
     unittest.main(verbosity=2)

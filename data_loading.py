@@ -89,12 +89,12 @@ class UnifiedDataset(Dataset):
         # Create the master index
         # self.task_indices will be a list of tuples: [('jigsaw', 0), ('jigsaw', 1), ..., ('goemotions', 0), ...]
         for task_name, data in self.task_data.items():
-            for i in range(len(data['texts'])):
+            for i in range(len(data['content'])): # <-- MODIFIED: use content
                 self.task_indices.append((task_name, i))
         
         print(f"\n--- Total Samples Loaded: {len(self)} ---")
         for task, data in self.task_data.items():
-            print(f"  - {task}: {len(data['texts'])} samples")
+            print(f"  - {task}: {len(data['content'])} samples") # <-- MODIFIED: use content
 
     def __len__(self):
         return len(self.task_indices)
@@ -104,21 +104,24 @@ class UnifiedDataset(Dataset):
         try:
             df = pd.read_csv(JIGSAW_PATH)
             df = df.dropna(subset=[JIGSAW_TEXT_COL] + JIGSAW_LABEL_COLS) # Drop bad rows
+            
+            content_list = df[JIGSAW_TEXT_COL].astype(str).tolist()
             self.task_data['jigsaw'] = {
-                'texts': df[JIGSAW_TEXT_COL].astype(str).tolist(),
+                'content': content_list,
+                'context': [""] * len(content_list), # <-- MODIFIED: Add empty context
                 'labels': df[JIGSAW_LABEL_COLS].values.tolist()
             }
         except FileNotFoundError:
             print(f"Error: Jigsaw file not found at {JIGSAW_PATH}")
             print("Please run the download_jigsaw.py script first.")
-            self.task_data['jigsaw'] = {'texts': [], 'labels': []}
+            self.task_data['jigsaw'] = {'content': [], 'context': [], 'labels': []}
 
     def _load_goemotions(self):
         print(f"Loading GoEmotions from {GOEMOTIONS_PATH_PATTERN}...")
         files = glob.glob(GOEMOTIONS_PATH_PATTERN)
         if not files:
             print("Error: No GoEmotions files found.")
-            self.task_data['goemotions'] = {'texts': [], 'labels': []}
+            self.task_data['goemotions'] = {'content': [], 'context': [], 'labels': []}
             return
             
         df = pd.concat([pd.read_csv(f) for f in files], ignore_index=True)
@@ -126,8 +129,11 @@ class UnifiedDataset(Dataset):
         
 
         df = df.dropna(subset=[GOEMOTIONS_TEXT_COL] + SCHEMA['goemotions'])
+        
+        content_list = df[GOEMOTIONS_TEXT_COL].astype(str).tolist()
         self.task_data['goemotions'] = {
-            'texts': df[GOEMOTIONS_TEXT_COL].astype(str).tolist(),
+            'content': content_list,
+            'context': [""] * len(content_list), # <-- MODIFIED: Add empty context
             'labels': df[SCHEMA['goemotions']].values.tolist()
         }
 
@@ -136,13 +142,16 @@ class UnifiedDataset(Dataset):
         try:
             df = pd.read_csv(DAVIDSON_PATH)
             df = df.dropna(subset=[DAVIDSON_TEXT_COL, DAVIDSON_LABEL_COL])
+            
+            content_list = df[DAVIDSON_TEXT_COL].astype(str).tolist()
             self.task_data['davidson'] = {
-                'texts': df[DAVIDSON_TEXT_COL].astype(str).tolist(),
+                'content': content_list,
+                'context': [""] * len(content_list), # <-- MODIFIED: Add empty context
                 'labels': df[DAVIDSON_LABEL_COL].map(DAVIDSON_LABEL_MAP).tolist()
             }
         except FileNotFoundError:
             print(f"Error: Davidson file not found at {DAVIDSON_PATH}")
-            self.task_data['davidson'] = {'texts': [], 'labels': []}
+            self.task_data['davidson'] = {'content': [], 'context': [], 'labels': []}
 
     def _load_olid(self):
         print(f"Loading OLID from {OLID_TWEETS_PATH} and {OLID_LABELS_PATH}...")
@@ -164,26 +173,30 @@ class UnifiedDataset(Dataset):
             df = pd.merge(df_tweets, df_labels, on='id_norm')
             
             df = df.dropna(subset=[OLID_TEXT_COL, OLID_LABEL_COL])
+            
+            content_list = df[OLID_TEXT_COL].astype(str).tolist()
             self.task_data['olid'] = {
-                'texts': df[OLID_TEXT_COL].astype(str).tolist(),
+                'content': content_list,
+                'context': [""] * len(content_list), # <-- MODIFIED: Add empty context
                 'labels': df[OLID_LABEL_COL].map(OLID_LABEL_MAP).tolist()
             }
         except FileNotFoundError:
             print(f"Error: OLID files not found at {OLID_TWEETS_PATH} or {OLID_LABELS_PATH}")
-            self.task_data['olid'] = {'texts': [], 'labels': []}
+            self.task_data['olid'] = {'content': [], 'context': [], 'labels': []}
         except Exception as e:
             print(f"Error loading OLID: {e}")
-            self.task_data['olid'] = {'texts': [], 'labels': []}
+            self.task_data['olid'] = {'content': [], 'context': [], 'labels': []}
 
     def _load_rumoureval(self):
         print(f"Loading RumourEval from {RUMOUR_TRAIN_PATH}...")
-        texts_a = []
-        texts_b = []
+        # --- MODIFIED: Rename for clarity ---
+        content_list = [] # Reply
+        context_list = [] # Source
         labels = []
 
         if not os.path.exists(RUMOUR_TRAIN_PATH):
             print(f"Error: RumourEval directory not found at {RUMOUR_TRAIN_PATH}")
-            self.task_data['rumour'] = {'texts': [], 'texts_b': [], 'labels': []}
+            self.task_data['rumour'] = {'content': [], 'context': [], 'labels': []}
             return
 
         # --- NEW FIX: Load labels from the -key.json files first ---
@@ -192,7 +205,7 @@ class UnifiedDataset(Dataset):
         
         if not key_files:
             print(f"Error: No *-key.json files (like train-key.json) found in {RUMOUR_TRAIN_PATH}")
-            self.task_data['rumour'] = {'texts': [], 'texts_b': [], 'labels': []}
+            self.task_data['rumour'] = {'content': [], 'context': [], 'labels': []}
             return
             
         for key_file in key_files:
@@ -220,7 +233,7 @@ class UnifiedDataset(Dataset):
         
         if not label_lookup:
             print("Error: Could not load any labels from *-key.json files. Stopping RumourEval load.")
-            self.task_data['rumour'] = {'texts': [], 'texts_b': [], 'labels': []}
+            self.task_data['rumour'] = {'content': [], 'context': [], 'labels': []}
             return
             
         print(f"Loaded a total of {len(label_lookup)} stance labels into lookup dictionary.")
@@ -290,16 +303,16 @@ class UnifiedDataset(Dataset):
                     # -------------------------------------------------------------
                     
                     if reply_text and stance in RUMOUR_LABEL_MAP:
-                        texts_a.append(reply_text.strip())
-                        texts_b.append(source_text.strip())
+                        content_list.append(reply_text.strip()) # <-- MODIFIED
+                        context_list.append(source_text.strip()) # <-- MODIFIED
                         labels.append(RUMOUR_LABEL_MAP[stance])
                         
             except Exception as e:
                 print(f"Warning: Failed to parse thread {structure_file}. Error: {e}")
 
         self.task_data['rumour'] = {
-            'texts': texts_a,
-            'texts_b': texts_b,
+            'content': content_list,
+            'context': context_list,
             'labels': labels
         }
         print(f"Loaded {len(labels)} RumourEval stance samples.")
@@ -309,27 +322,21 @@ class UnifiedDataset(Dataset):
         task_name, item_index = self.task_indices[idx]
         
         # 2. Get the text(s) and label(s) for this item
+        # --- MODIFIED: Use 'content' and 'context' ---
         item = self.task_data[task_name]
-        text_a = item['texts'][item_index]
-        text_b = item.get('texts_b', [None]*len(item['texts']))[item_index] # For RumourEval
+        content = item['content'][item_index]
+        context = item['context'][item_index]
         
         # 3. Tokenize the text
-        if text_b:
-            tokenized_input = self.tokenizer(
-                text_a, text_b, 
-                truncation='only_first', # Truncate reply first
-                max_length=self.max_length, 
-                padding='max_length',
-                return_tensors="pt" # Return PyTorch tensors
-            )
-        else:
-            tokenized_input = self.tokenizer(
-                text_a, 
-                truncation=True, 
-                max_length=self.max_length, 
-                padding='max_length',
-                return_tensors="pt" # Return PyTorch tensors
-            )
+        # --- MODIFIED: Always use (context, content) pair ---
+        # We truncate the context first, preserving the content.
+        tokenized_input = self.tokenizer(
+            context, content, 
+            truncation='longest_first', # Truncate context first
+            max_length=self.max_length, 
+            padding='max_length',
+            return_tensors="pt" # Return PyTorch tensors
+        )
 
         # 4. Build the master label dictionary
         
@@ -532,7 +539,10 @@ if __name__ == "__main__":
         print({k: v.shape for k, v in batch.items()})
         
         print("\nDecoded Text (Sample 0 from Batch):")
-        print(dataset.tokenizer.decode(batch['input_ids'][0], skip_special_tokens=True))
+        # --- MODIFIED: Decode differently for context/content ---
+        input_ids = batch['input_ids'][0]
+        decoded = dataset.tokenizer.decode(input_ids, skip_special_tokens=False)
+        print(decoded)
         
         print("\nJigsaw Labels (Sample 0 from Batch):")
         print(batch['labels_jigsaw'][0])

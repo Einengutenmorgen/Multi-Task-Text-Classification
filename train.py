@@ -31,15 +31,15 @@ from loss import MultiTaskLoss
 # --- 1. Configuration ---
 CONFIG = {
     "MODEL_NAME": "mixedbread-ai/mxbai-embed-large-v1",
-    "EPOCHS": 3,
-    "BATCH_SIZE": 8,  # Adjust based on your VRAM
-    "MAX_LENGTH": 256,
+    "EPOCHS": 5,
+    "BATCH_SIZE": 16,  # Adjust based on your VRAM
+    "MAX_LENGTH": 312,
     "BASE_LR": None,   # For the mxbai trunk (Set to None to freeze)
     "HEAD_LR": 1e-4,   # For our new classification heads
     "WEIGHT_DECAY": 0.01,
     "VALIDATION_SPLIT": 0.1, # 10% for validation
-    "CHECKPOINT_DIR": "./checkpoints/v2/",
-    "EPOCH_SAMPLING_SIZE": None # Options: None (use min), int (e.g. 50000), "max" (use max)
+    "CHECKPOINT_DIR": "./checkpoints/v3/",
+    "EPOCH_SAMPLING_SIZE": 50000 # Options: None (use min), int (e.g. 50000), "max" (use max)
 }
 
 # Define our 5 tasks
