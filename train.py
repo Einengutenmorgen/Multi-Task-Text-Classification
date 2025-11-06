@@ -3,9 +3,7 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-# Import Subset for manual splitting
 from torch.utils.data import DataLoader, SequentialSampler, Subset
-# Import sklearn's train_test_split
 from sklearn.model_selection import train_test_split
 from transformers import get_linear_schedule_with_warmup
 import numpy as np
@@ -17,29 +15,35 @@ import json
 # Import our custom modules
 import data_loading
 from data_loading import (
-    UnifiedDataset,
-    TaskSampler,
-    SCHEMA,
-    JIGSAW_LABEL_COLS,
-    DAVIDSON_LABEL_MAP,
-    OLID_LABEL_MAP,
+    UnifiedDataset, 
+    TaskSampler, 
+    SCHEMA, 
+    JIGSAW_LABEL_COLS, 
+    GOEMOTIONS_LABEL_COLS, # <-- Need to import this
+    DAVIDSON_LABEL_MAP, 
+    OLID_LABEL_MAP, 
     RUMOUR_LABEL_MAP
 )
 from model import MultiTaskModel
 from loss import MultiTaskLoss
 
-# --- 1. Configuration ---
+# --- 1. Configuration (v5 - LoRA) ---
 CONFIG = {
     "MODEL_NAME": "mixedbread-ai/mxbai-embed-large-v1",
-    "EPOCHS": 5,
-    "BATCH_SIZE": 16,  # Adjust based on your VRAM
-    "MAX_LENGTH": 312,
-    "BASE_LR": None,   # For the mxbai trunk (Set to None to freeze)
-    "HEAD_LR": 1e-4,   # For our new classification heads
+    "EPOCHS": 3,           # <-- Let's try 5 epochs, PEFT can overfit less
+    "BATCH_SIZE": 8,      # Physical batch size that fits in VRAM
+    "MAX_LENGTH": 124,
+    "BASE_LR": 1e-4,       # <-- LR for LoRA layers (can be higher than full fine-tune)
+    "HEAD_LR": 1e-4,       # <-- Match LoRA LR
     "WEIGHT_DECAY": 0.01,
-    "VALIDATION_SPLIT": 0.1, # 10% for validation
-    "CHECKPOINT_DIR": "./checkpoints/v3/",
-    "EPOCH_SAMPLING_SIZE": 50000 # Options: None (use min), int (e.g. 50000), "max" (use max)
+    "VALIDATION_SPLIT": 0.1,
+    "CHECKPOINT_DIR": "./checkpoints/v5_lora/", # <-- NEW: v5 directory
+    "EPOCH_SAMPLING_SIZE": 50000,
+    
+    # --- SPEED OPTIMIZATIONS ---
+    "NUM_WORKERS": 8,
+    "PIN_MEMORY": False,   # <-- Correct setting for MPS
+    "GRADIENT_ACCUMULATION_STEPS": 8 # Effective batch size = 16 * 4 = 64
 }
 
 # Define our 5 tasks
@@ -47,10 +51,10 @@ TASKS = ['jigsaw', 'goemotions', 'davidson', 'olid', 'rumour']
 
 def get_label_counts(dataset_schema):
     """Gets the number of labels for each task from our schema."""
-
+    
     # We must access the *loaded* schema from the dataset instance
     # because 'goemotions' is auto-detected.
-
+    
     return {
         'jigsaw': len(JIGSAW_LABEL_COLS),
         'goemotions': len(dataset_schema['goemotions']),
@@ -59,80 +63,27 @@ def get_label_counts(dataset_schema):
         'rumour': len(RUMOUR_LABEL_MAP)
     }
 
-
-def compute_task_class_weights(dataset, indices, label_counts):
-    """Compute class and positive weights for each task using the training subset."""
-
-    ce_tasks = ['davidson', 'olid', 'rumour']
-    bce_tasks = ['jigsaw', 'goemotions']
-
-    ce_counts = {
-        task: torch.zeros(label_counts[task], dtype=torch.float32)
-        for task in ce_tasks
-    }
-
-    bce_positive_counts = {
-        task: torch.zeros(label_counts[task], dtype=torch.float32)
-        for task in bce_tasks
-    }
-    bce_total_counts = {task: 0 for task in bce_tasks}
-
-    for idx in indices:
-        task_name, item_idx = dataset.task_indices[idx]
-        labels = dataset.task_data[task_name]['labels'][item_idx]
-
-        if task_name in ce_counts:
-            label_idx = int(labels)
-            if 0 <= label_idx < ce_counts[task_name].numel():
-                ce_counts[task_name][label_idx] += 1
-        elif task_name in bce_positive_counts:
-            label_tensor = torch.tensor(labels, dtype=torch.float32)
-            bce_positive_counts[task_name] += label_tensor
-            bce_total_counts[task_name] += 1
-
-    ce_weights = {}
-    for task, counts in ce_counts.items():
-        total = counts.sum()
-        if total > 0:
-            weights = torch.where(
-                counts > 0,
-                total / torch.clamp(counts, min=1e-6),
-                torch.zeros_like(counts)
-            )
-        else:
-            weights = torch.ones_like(counts)
-        ce_weights[task] = weights
-
-    bce_pos_weights = {}
-    for task, pos_counts in bce_positive_counts.items():
-        total_samples = bce_total_counts[task]
-        if total_samples > 0:
-            weights = torch.where(
-                pos_counts > 0,
-                total_samples / torch.clamp(pos_counts, min=1e-6),
-                torch.zeros_like(pos_counts)
-            )
-        else:
-            weights = torch.ones_like(pos_counts)
-        bce_pos_weights[task] = weights
-
-    return ce_weights, bce_pos_weights
-
 def batch_to_device(batch, device):
     """Moves all tensor values in a batch dictionary to the specified device."""
     return {k: v.to(device) for k, v in batch.items()}
 
+# --- MODIFIED: train_one_epoch with Optimizations ---
 def train_one_epoch(model, dataloader, loss_fn, optimizer, scheduler, device):
-    """Performs one full training epoch."""
+    """Performs one full training epoch with mixed precision and gradient accumulation."""
     model.train()
     
     # Track losses
     total_loss_sum = 0
     task_loss_sums = {task: 0 for task in TASKS}
     
+    accumulation_steps = CONFIG["GRADIENT_ACCUMULATION_STEPS"]
+    
     loop = tqdm(dataloader, desc=f"Training Epoch", leave=False)
     
-    for batch in loop:
+    # --- NEW: Zero grad at the start ---
+    optimizer.zero_grad()
+    
+    for step, batch in enumerate(loop):
         # 1. Move batch to device
         batch = batch_to_device(batch, device)
         
@@ -142,35 +93,40 @@ def train_one_epoch(model, dataloader, loss_fn, optimizer, scheduler, device):
             'attention_mask': batch['attention_mask']
         }
         
-        # 3. Forward pass (Model -> Logits)
-        outputs = model(**inputs)
-        
-        # 4. Calculate losses (Logits + Labels -> 6 Losses)
-        losses = loss_fn(model_outputs=outputs, batch_labels=batch)
+        # 3. --- NEW: Automatic Mixed Precision (AMP) ---
+        # Use torch.autocast for faster float16 computations
+        with torch.autocast(device_type=device.type, dtype=torch.bfloat16 if device.type == 'cuda' else torch.float16):
+            outputs = model(**inputs)
+            losses = loss_fn(model_outputs=outputs, batch_labels=batch)
+            
+            # --- NEW: Scale loss for accumulation ---
+            loss = losses['total_loss'] / accumulation_steps
         
         # 5. Backpropagation
-        optimizer.zero_grad()
-        # # --- NaN GUARD ---
-        # if not torch.isnan(losses['total_loss']):
-        #     losses['total_loss'].backward()
-        #     optimizer.step()
-        #     scheduler.step()
-        # else:
-        #     print("WARNING: Skipping batch due to NaN total_loss.")
-        # ---------------
-        losses['total_loss'].backward()
-        optimizer.step()
-        scheduler.step()
-        # 6. Log losses
+        # Note: We don't need GradScaler for MPS, just backward()
+        loss.backward()
+        
+        # 6. --- NEW: Gradient Accumulation Step ---
+        if (step + 1) % accumulation_steps == 0 or (step + 1) == len(dataloader):
+            # Clip gradients to prevent exploding gradients (good practice)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            
+            # Perform the optimizer step
+            optimizer.step()
+            scheduler.step()
+            
+            # Zero the gradients for the *next* accumulation cycle
+            optimizer.zero_grad()
+
+        # 7. Log losses (using the *unscaled* loss)
         total_loss_sum += losses['total_loss'].item()
         for task in TASKS:
             task_loss_sums[task] += losses[f'loss_{task}'].item()
             
-        # Update TQDM with live loss
+        # Update TQDM with live *unscaled* loss
         loop.set_postfix(
-            total_loss=losses['total_loss'].item(),
-            jigsaw=losses['loss_jigsaw'].item(),
-            go=losses['loss_goemotions'].item()
+            loss=losses['total_loss'].item(),
+            lr=scheduler.get_last_lr()[0]
         )
         
     # Return average losses for the epoch
@@ -186,46 +142,38 @@ def evaluate(model, dataloader, loss_fn, device):
     """Performs one full validation run."""
     model.eval()
     
-    # Store all predictions and labels for F1 calculation
     all_preds = {task: [] for task in TASKS}
     all_labels = {task: [] for task in TASKS}
     
     loop = tqdm(dataloader, desc="Evaluating", leave=False)
     
     for batch in loop:
-        # 1. Move batch to device
         batch = batch_to_device(batch, device)
         
-        # 2. Get inputs and labels
         inputs = {
             'input_ids': batch['input_ids'],
             'attention_mask': batch['attention_mask']
         }
         labels = batch
         
-        # 3. Forward pass (Model -> Logits)
-        outputs = model(**inputs)
+        # --- NEW: Use autocast for evaluation (faster) ---
+        with torch.autocast(device_type=device.type, dtype=torch.bfloat16 if device.type == 'cuda' else torch.float16):
+            outputs = model(**inputs)
         
         # 4. Filter active predictions and labels for each task
         for task in TASKS:
             task_logits = outputs[task]
             task_labels = labels[f'labels_{task}']
             
-            # --- Find active samples ---
             if task in ['jigsaw', 'goemotions']:
-                # Multi-label: active if first label is not -100
                 mask = task_labels[:, 0] != -100
                 if mask.sum() == 0: continue
-                # Get preds: Apply sigmoid and threshold
                 task_preds = (torch.sigmoid(task_logits[mask]) > 0.5).int()
             else:
-                # Multi-class: active if label is not -100
                 mask = task_labels != -100
                 if mask.sum() == 0: continue
-                # Get preds: Argmax
                 task_preds = torch.argmax(task_logits[mask], dim=1)
             
-            # Store the active preds and labels
             all_preds[task].append(task_preds.cpu().numpy())
             all_labels[task].append(task_labels[mask].cpu().numpy())
 
@@ -238,108 +186,126 @@ def evaluate(model, dataloader, loss_fn, device):
             metrics[f'{task}_f1_macro'] = 0.0 # Use macro key
             continue
             
-        # Concatenate all batch results
         task_all_labels = np.concatenate(all_labels[task])
         task_all_preds = np.concatenate(all_preds[task])
         
-        # --- Use 'macro' average for imbalanced data ---
         f1 = f1_score(task_all_labels, task_all_preds, average='macro', zero_division=0)
         metrics[f'{task}_f1_macro'] = f1
         
-    # Calculate the main metric: Average F1
     metrics['avg_f1_macro'] = np.mean(list(metrics.values()))
     
     return metrics
 
 
+# --- MODIFIED: main() to pre-calculate weights ---
 def main():
     print("--- Starting V1 Multi-Task Training Pipeline ---")
     
-    # --- 1. Setup Device ---
     device = torch.device("cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu")
     print(f"Using device: {device}")
     
-    # --- 2. Load and Split Dataset ---
     print(f"Loading full dataset for model: {CONFIG['MODEL_NAME']}")
     full_dataset = UnifiedDataset(tokenizer_name=CONFIG['MODEL_NAME'], max_length=CONFIG['MAX_LENGTH'])
     
-    # Get label counts *after* loading dataset
-    label_counts = get_label_counts(SCHEMA)
+    # --- FIX: Pass the correct schema object ---
+    label_counts = get_label_counts(SCHEMA) 
     print(f"Discovered label counts: {label_counts}")
 
-    # =================== NEW STRATIFIED SPLIT ===================
     print("Creating task-stratified train/val split...")
-
-    # 1. Get the list of all indices (0 to N-1)
     all_indices = list(range(len(full_dataset)))
-    
-    # 2. Get the corresponding task name for each index (for stratification)
-    # This creates a list like ['jigsaw', 'jigsaw', ..., 'goemotions', ..., 'davidson', ...]
     labels_for_stratify = [task_name for (task_name, _) in full_dataset.task_indices]
 
-    # 3. Use sklearn's train_test_split to get stratified indices
     train_indices, val_indices = train_test_split(
         all_indices,
         test_size=CONFIG['VALIDATION_SPLIT'],
-        stratify=labels_for_stratify, # <-- Stratify by task name
+        stratify=labels_for_stratify,
         random_state=42
     )
 
-    # 4. Create PyTorch Subset objects from these indices
     train_dataset = Subset(full_dataset, train_indices)
     val_dataset = Subset(full_dataset, val_indices)
-    # ============================================================
 
-    # --- This is the correct patching ---
-    # Give the Subset the attributes our TaskSampler needs to find
     train_dataset.task_data = full_dataset.task_data
     train_dataset.full_task_indices_list = full_dataset.task_indices
-    # ------------------------------------
 
     print(f"Total samples: {len(full_dataset)}")
     print(f"Training samples: {len(train_dataset)}")
     print(f"Validation samples: {len(val_dataset)}")
 
-    # --- Compute class weights for loss balancing ---
-    ce_weights, bce_pos_weights = compute_task_class_weights(
-        full_dataset,
-        train_indices,
-        label_counts
-    )
+    # --- NEW: Pre-calculate Class Weights (Phase 2) ---
+    print("Calculating class weights for loss balancing...")
+    ce_weights = {}
+    bce_pos_weights = {}
 
-    # --- 3. Create DataLoaders ---
-    # Training: Use TaskSampler for balanced batches
+    # Get all labels from the *training set*
+    train_labels = {task: [] for task in TASKS}
+    for idx in tqdm(train_dataset.indices, desc="Scanning train labels"):
+        task_name, item_index = full_dataset.task_indices[idx]
+        train_labels[task_name].append(full_dataset.task_data[task_name]['labels'][item_index])
+
+    # 1. Calculate CE weights (Davidson, OLID, Rumour)
+    for task in ['davidson', 'olid', 'rumour']:
+        labels = np.array(train_labels[task])
+        num_classes = label_counts[task]
+        counts = np.bincount(labels, minlength=num_classes)
+        
+        # Calculate weights: N_total / (N_classes * N_class)
+        total_samples = counts.sum()
+        if total_samples > 0:
+            weights = total_samples / (num_classes * counts + 1e-8) # Add epsilon to avoid div by zero
+            ce_weights[task] = torch.tensor(weights, dtype=torch.float)
+            print(f"  - {task} weights: {weights}")
+        else:
+            ce_weights[task] = None # No data for this task in split
+
+    # 2. Calculate BCE pos_weights (Jigsaw, GoEmotions)
+    for task in ['jigsaw', 'goemotions']:
+        labels_np = np.array(train_labels[task])
+        if labels_np.shape[0] > 0:
+            # N_negative / N_positive
+            n_pos = np.sum(labels_np, axis=0)
+            n_neg = labels_np.shape[0] - n_pos
+            pos_weights = n_neg / (n_pos + 1e-8)
+            bce_pos_weights[task] = torch.tensor(pos_weights, dtype=torch.float)
+            print(f"  - {task} pos_weights (avg): {pos_weights.mean()}")
+        else:
+            bce_pos_weights[task] = None
+    # --- End Class Weight Calculation ---
+
     print(f"Initializing TaskSampler with strategy: {CONFIG['EPOCH_SAMPLING_SIZE']}")
     train_sampler = TaskSampler(
         train_dataset,
         epoch_sampling_size=CONFIG['EPOCH_SAMPLING_SIZE']
     )
+    
+    # --- MODIFIED: Added num_workers and pin_memory ---
     train_loader = DataLoader(
         train_dataset,
         batch_size=CONFIG['BATCH_SIZE'],
         sampler=train_sampler,
-        num_workers=2  # Use 0 if you get errors, but >0 is faster
+        num_workers=CONFIG['NUM_WORKERS'],
+        pin_memory=CONFIG['PIN_MEMORY'] # <-- This will now correctly pass False
     )
     
-    # Validation: Use SequentialSampler for correct metric calculation
     val_sampler = SequentialSampler(val_dataset)
     val_loader = DataLoader(
         val_dataset,
         batch_size=CONFIG['BATCH_SIZE'],
         sampler=val_sampler,
-        num_workers=2
+        num_workers=CONFIG['NUM_WORKERS'],
+        pin_memory=CONFIG['PIN_MEMORY'] # <-- This will now correctly pass False
     )
 
-    # --- 4. Initialize Model (MODIFIED) ---
     print("Initializing MultiTaskModel...")
     
-    # --- NEW: Determine if trunk should be frozen ---
-    freeze_trunk_bool = (CONFIG["BASE_LR"] is None)
-    if freeze_trunk_bool:
-        print("BASE_LR is None. Freezing trunk parameters.")
-    else:
-        print(f"BASE_LR is {CONFIG['BASE_LR']}. Trunk parameters will be fine-tuned.")
-    # ------------------------------------------------
+    # --- MODIFIED FOR LORA ---
+    # We tell the model to freeze the trunk.
+    # The model.py logic will then apply LoRA.
+    # The model's .get_optimizer_params will return the LoRA params.
+    # The optimizer will use CONFIG["BASE_LR"] for those params.
+    freeze_trunk_bool = True # <-- This now means "Use LoRA"
+    
+    print(f"freeze_trunk={freeze_trunk_bool}. LoRA will be enabled.")
     
     model = MultiTaskModel(
         model_name=CONFIG["MODEL_NAME"],
@@ -348,21 +314,19 @@ def main():
         num_labels_davidson=len(data_loading.SCHEMA["davidson"]),
         num_labels_olid=len(data_loading.SCHEMA["olid"]),
         num_labels_rumour=len(data_loading.SCHEMA["rumour"]),
-        freeze_trunk=freeze_trunk_bool  # <-- Pass the new argument
+        freeze_trunk=freeze_trunk_bool # <-- Set to True to enable PEFT/LoRA
     )
 
     model.to(device)
 
-    # --- 5. Initialize Loss, Optimizer, and Scheduler ---
+    # --- MODIFIED: Pass weights to loss function ---
     loss_fn = MultiTaskLoss(
         ce_weights=ce_weights,
         bce_pos_weights=bce_pos_weights
     ).to(device)
     
-    # Get parameter groups for differential LR
-    # This now correctly handles the frozen/unfrozen trunk
     optimizer_params = model.get_optimizer_params(
-        base_lr=CONFIG['BASE_LR'],
+        base_lr=CONFIG['BASE_LR'], # This LR will be applied to LoRA params
         head_lr=CONFIG['HEAD_LR']
     )
     
@@ -371,8 +335,8 @@ def main():
         weight_decay=CONFIG['WEIGHT_DECAY']
     )
     
-    # Scheduler
-    num_training_steps = len(train_loader) * CONFIG['EPOCHS']
+    # --- MODIFIED: Calculate scheduler steps based on accumulation ---
+    num_training_steps = (len(train_loader) // CONFIG['GRADIENT_ACCUMULATION_STEPS']) * CONFIG['EPOCHS']
     num_warmup_steps = int(num_training_steps * 0.1) # 10% warmup
     
     scheduler = get_linear_schedule_with_warmup(
@@ -381,14 +345,12 @@ def main():
         num_training_steps=num_training_steps
     )
     
-    # --- 6. Training & Evaluation Loop ---
     best_avg_f1 = 0.0
     os.makedirs(CONFIG['CHECKPOINT_DIR'], exist_ok=True)
     
     for epoch in range(CONFIG['EPOCHS']):
         print(f"\n--- Epoch {epoch + 1} / {CONFIG['EPOCHS']} ---")
         
-        # Train
         avg_total_loss, avg_task_losses = train_one_epoch(
             model, train_loader, loss_fn, optimizer, scheduler, device
         )
@@ -396,7 +358,6 @@ def main():
         for task, loss in avg_task_losses.items():
             print(f"  - Avg Train {task} Loss: {loss:.4f}")
 
-        # Evaluate
         val_metrics = evaluate(model, val_loader, loss_fn, device)
         
         print(f"Epoch {epoch+1} Validation Metrics:")
@@ -404,14 +365,12 @@ def main():
             print(f"  - {task.capitalize()} F1 (Macro): {val_metrics[f'{task}_f1_macro']:.4f}")
         print(f"  - === Average F1 (Macro): {val_metrics['avg_f1_macro']:.4f} === ")
         
-        # --- 7. Checkpointing ---
         if val_metrics['avg_f1_macro'] > best_avg_f1:
             best_avg_f1 = val_metrics['avg_f1_macro']
             checkpoint_path = os.path.join(CONFIG['CHECKPOINT_DIR'], "best_model.pth")
             print(f"New best model! Saving checkpoint to {checkpoint_path}")
             torch.save(model.state_dict(), checkpoint_path)
             
-            # Save metrics
             metrics_path = os.path.join(CONFIG['CHECKPOINT_DIR'], "best_metrics.json")
             with open(metrics_path, 'w') as f:
                 json.dump(val_metrics, f, indent=2)
@@ -420,7 +379,8 @@ def main():
     print(f"Best Average F1 Score: {best_avg_f1:.4f}")
     print(f"Best model saved to {os.path.join(CONFIG['CHECKPOINT_DIR'], 'best_model.pth')}")
 
-def initialize_training_objects(device, ce_weights=None, bce_pos_weights=None):
+# --- MODIFIED: initialize_training_objects to pass weights ---
+def initialize_training_objects(device):
     """
     Factory to initialize model, loss, and optimizer exactly as used in training.
     (MODIFIED)
@@ -429,11 +389,18 @@ def initialize_training_objects(device, ce_weights=None, bce_pos_weights=None):
     from model import MultiTaskModel
     from loss import MultiTaskLoss
 
-    num_labels = {k: len(v) for k, v in data_loading.SCHEMA.items()}
+    # --- FIX: Need to get label_counts properly ---
+    # This requires loading the schema from data_loading
+    num_labels = {
+        'jigsaw': len(data_loading.JIGSAW_LABEL_COLS),
+        'goemotions': len(data_loading.GOEMOTIONS_LABEL_COLS),
+        'davidson': len(data_loading.DAVIDSON_LABEL_MAP),
+        'olid': len(data_loading.OLID_LABEL_MAP),
+        'rumour': len(data_loading.RUMOUR_LABEL_MAP)
+    }
 
-    # --- NEW: Add freeze logic ---
-    freeze_trunk_bool = (CONFIG["BASE_LR"] is None)
-    # -----------------------------
+    # --- MODIFIED: Set freeze_trunk=True to enable LoRA ---
+    freeze_trunk_bool = True 
 
     model = MultiTaskModel(
         model_name=CONFIG["MODEL_NAME"],
@@ -442,16 +409,13 @@ def initialize_training_objects(device, ce_weights=None, bce_pos_weights=None):
         num_labels_davidson=num_labels["davidson"],
         num_labels_olid=num_labels["olid"],
         num_labels_rumour=num_labels["rumour"],
-        freeze_trunk=freeze_trunk_bool # <-- Pass the new argument
+        freeze_trunk=freeze_trunk_bool
     ).to(device)
 
-    loss_fn = MultiTaskLoss(
-        ce_weights=ce_weights,
-        bce_pos_weights=bce_pos_weights
-    ).to(device)
+    # --- MODIFIED: Pass dummy weights (None) ---
+    # Tests don't need real weights, just the correct init signature
+    loss_fn = MultiTaskLoss(ce_weights=None, bce_pos_weights=None).to(device)
     
-    # --- NEW: Update optimizer init ---
-    # Get param groups correctly
     optimizer_params = model.get_optimizer_params(
         base_lr=CONFIG["BASE_LR"],
         head_lr=CONFIG["HEAD_LR"]
@@ -460,38 +424,27 @@ def initialize_training_objects(device, ce_weights=None, bce_pos_weights=None):
         optimizer_params,
         weight_decay=CONFIG['WEIGHT_DECAY']
     )
-    # ----------------------------------
 
     return model, loss_fn, optimizer
 
 
+# --- MODIFIED: train_step for autocast and accumulation ---
 def train_step(model, loss_fn, optimizer, batch):
+    # This function is used by test_integration_train.py
+    # We will simulate a single step with accumulation_steps=1
     model.train()
     optimizer.zero_grad(set_to_none=True)
 
-    outputs = model(batch["input_ids"], batch["attention_mask"])
-    loss_dict = loss_fn(outputs, {k: v for k, v in batch.items() if k.startswith("labels_")})
-
-    if isinstance(loss_dict, dict):
-        for task, val in loss_dict.items():
-            if torch.isnan(val):
-                print(f"⚠️  NaN in loss for {task}: {val}")
-        loss = loss_dict.get('total_loss', sum(loss_dict.values()))
-    else:
-        loss = loss_dict
+    # Use autocast for mixed precision
+    with torch.autocast(device_type=batch['input_ids'].device.type, dtype=torch.bfloat16 if batch['input_ids'].device.type == 'cuda' else torch.float16):
+        outputs = model(batch["input_ids"], batch["attention_mask"])
+        loss_dict = loss_fn(outputs, {k: v for k, v in batch.items() if k.startswith("labels_")})
+        loss = loss_dict.get('total_loss')
 
     if torch.isnan(loss):
         print("⚠️  NaN total loss! Inspect per-task above.")
-        for name, logits in outputs.items():
-            if torch.isnan(logits).any():
-                print(f"   -> NaN in logits for {name}")
-        for k, v in batch.items():
-            if k.startswith("labels_") and torch.isnan(v).any():
-                print(f"   -> NaN in labels for {k}")
-        for k, v in batch.items():
-            if k.startswith("labels_"):
-                print(f"{k}: min={v.min().item()}, max={v.max().item()}, dtype={v.dtype}")
     else:
+        # No scaler needed for MPS
         loss.backward()
         optimizer.step()
     

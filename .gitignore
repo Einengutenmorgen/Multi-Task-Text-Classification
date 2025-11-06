@@ -11,7 +11,7 @@ checkpoints
 __pycache__/
 *.py[codz]
 *$py.class
-
+*.zip
 # C extensions
 *.so
 
