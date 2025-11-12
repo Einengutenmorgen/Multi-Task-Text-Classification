@@ -12,8 +12,17 @@ __pycache__/
 *.py[codz]
 *$py.class
 *.zip
+seed_data/
+processed_superlabel_dataset/
+tuned_models/single_task/
+*.bin
+*.safetensors
+*.pth
+tuned_models/superlabel_finetune/checkpoint-22470
+tuned_models/superlabel_finetune/checkpoint-33705
 # C extensions
 *.so
+wandb/
 
 # Distribution / packaging
 .Python

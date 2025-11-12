@@ -8,7 +8,7 @@ from transformers import AutoTokenizer
 # We need the model definition and the label maps to build the model
 # and make the output human-readable.
 
-from model import MultiTaskModel
+from model_v3 import MultiTaskModel
 from data_loading import (
     JIGSAW_LABEL_COLS,
     GOEMOTIONS_LABEL_COLS,
@@ -20,9 +20,9 @@ from data_loading import (
 # --- Configuration (Must match train.py) ---
 CONFIG = {
     "MODEL_NAME": "mixedbread-ai/mxbai-embed-large-v1",
-    "MAX_LENGTH": 256,
+    "MAX_LENGTH": 124,
     # --- IMPORTANT: Update checkpoint path ---
-    "CHECKPOINT_PATH": "./checkpoints/v2/best_model.pth",
+    "CHECKPOINT_PATH": "./checkpoints/v3/best_model.pth",
     # --- IMPORTANT: Set based on training log ---
     # Your log said "BASE_LR is None. Freezing trunk parameters."
     # So we set freeze_trunk=True.
@@ -118,7 +118,7 @@ def predict(model, tokenizer, device, text_a, text_b=None):
         # Single sentence
         tokenized_input = tokenizer(
             text_a, 
-            truncation=True, 
+            #truncation=True, 
             max_length=CONFIG["MAX_LENGTH"], 
             padding='max_length',
             return_tensors="pt"
